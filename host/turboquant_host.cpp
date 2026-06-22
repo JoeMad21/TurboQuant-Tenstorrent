@@ -98,17 +98,23 @@ static std::vector<uint8_t> read_bin(const std::string& path) {
 // MeshBuffer helper
 // ---------------------------------------------------------------------------
 
-static std::shared_ptr<distributed::MeshBuffer> make_mesh_buf(
+static std::shared_ptr<distributed::MeshBuffer> make_sharded_buf(
     distributed::MeshDevice* dev,
-    uint32_t total_bytes,
+    uint32_t shard_bytes,
     uint32_t page_bytes)
 {
-    distributed::ReplicatedBufferConfig rep_cfg{ .size = total_bytes };
+    distributed::ShardedBufferConfig shard_cfg{
+        .global_size         = shard_bytes,
+        .global_buffer_shape = {1, static_cast<uint32_t>(shard_bytes * dev->num_devices())},
+        .shard_shape         = {1, shard_bytes},
+        .shard_orientation   = ShardOrientation::ROW_MAJOR,
+    };
     distributed::DeviceLocalBufferConfig local_cfg{
         .page_size   = page_bytes,
         .buffer_type = BufferType::DRAM,
     };
     return distributed::MeshBuffer::create(rep_cfg, local_cfg, dev);
+    return distributed::MeshBuffer::create(shard_cfg, local_cfg, dev);
 }
 
 // ---------------------------------------------------------------------------
@@ -120,18 +126,16 @@ static std::vector<uint8_t> run_isolated_stage(
     distributed::MeshCommandQueue&           cq,
     const distributed::MeshCoordinateRange&  dev_range,
     uint64_t                                 src_addr,   // DeviceAddr is uint64
-    uint32_t                                 num_vectors,
+    uint32_t                                 vecs_per_chip,
     int                                      last_stage,
     tt::CB                                   dump_cb,
-    uint32_t                                 dump_page_bytes,
-    uint64_t                                 cent_addr = 0)
+    uint32_t                                 dump_page_bytes)
 {
-    const uint32_t num_tiles  = (num_vectors + kN - 1) / kN;
+    const uint32_t num_tiles  = (vecs_per_chip + kN - 1) / kN;
     const uint32_t bytes_fp16 = kN * kD * 2;
     const uint32_t bytes_pq   = kN * turboquant::kPolarQuantBytes;
-    const uint32_t bytes_qjl  = kN * (turboquant::kQjlBytes + turboquant::kRNormBytes);
 
-    auto dump_buf = make_mesh_buf(mesh_dev,
+    auto dump_buf = make_sharded_buf(mesh_dev,
                                   num_tiles * dump_page_bytes, dump_page_bytes);
 
     Program prog = CreateProgram();
@@ -141,7 +145,8 @@ static std::vector<uint8_t> run_isolated_stage(
     // CircularBuffers — build config without method chaining (older API style)
     auto make_cb = [&](tt::CB id, uint32_t page, tt::DataFormat fmt) {
         std::map<uint8_t, tt::DataFormat> data_format_spec = {{static_cast<uint8_t>(id), fmt}};
-        CircularBufferConfig cfg(2 * page, data_format_spec);
+        uint32_t num_pages = num_tiles + 2; 
+        CircularBufferConfig cfg(num_pages * page, data_format_spec);
         cfg.set_page_size(static_cast<uint8_t>(id), page);
         CreateCircularBuffer(prog, core_range, cfg);
     };
@@ -149,9 +154,7 @@ static std::vector<uint8_t> run_isolated_stage(
     make_cb(tt::CB::c_in1,  bytes_fp16, tt::DataFormat::Float16_b);
     make_cb(tt::CB::c_in2,  bytes_pq,   tt::DataFormat::RawUInt8);
     make_cb(tt::CB::c_in3,  bytes_fp16, tt::DataFormat::Float16_b);
-    make_cb(tt::CB::c_out0, bytes_qjl,  tt::DataFormat::RawUInt8);
 
-    std::vector<uint32_t> cargs = {num_tiles};
 
     // Common defines for all compute kernels
     std::map<std::string, std::string> kdefines = {
@@ -167,48 +170,23 @@ static std::vector<uint8_t> run_isolated_stage(
     if (last_stage == 0) {
         // Stage 0: rotation — reads DRAM directly, writes c_in1
         auto rk = CreateKernel(prog,
-            "kernels/rotation_kernel.cpp", core_range,
+            "/hdd/john/TurboQuant-Tenstorrent/kernels/rotation_kernel.cpp", core_range,
             DataMovementConfig{
                 .processor = DataMovementProcessor::RISCV_0,
                 .noc       = NOC::RISCV_0_default,
                 .defines   = kdefines,
             });
         SetRuntimeArgs(prog, rk, core,
-                       {static_cast<uint32_t>(src_addr), num_vectors, kD, kN});
+                       {static_cast<uint32_t>(src_addr), vecs_per_chip, kD, kN});
     } else if (last_stage == 1) {
         // Stage 1: polarquant — reads c_in1 (written by stage 0 via dump reload)
-        auto rk = CreateKernel(prog,
-            "kernels/polarquant_kernel.cpp", core_range,
+        auto rk = CreateKernel(prog, "/hdd/john/TurboQuant-Tenstorrent/kernels/polarquant_kernel.cpp", core_range,
             DataMovementConfig{
                 .processor = DataMovementProcessor::RISCV_0,
                 .noc       = NOC::RISCV_0_default,
                 .defines   = kdefines,
             });
-        SetRuntimeArgs(prog, rk, core,
-                       {static_cast<uint32_t>(src_addr), num_vectors, kD, kN});
-    } else if (last_stage == 2) {
-        // Stage 2: qjl - one core per vector for parallelism
-        const uint32_t cores_x = 8u, cores_y = 4u;
-        tt::tt_metal::CoreRange multi_core_range(
-            tt::tt_metal::CoreCoord{0, 0},
-            tt::tt_metal::CoreCoord{cores_x - 1, cores_y - 1});
-        auto rk = CreateKernel(prog,
-            "kernels/qjl_kernel.cpp", multi_core_range,
-            DataMovementConfig{
-                .processor = DataMovementProcessor::RISCV_0,
-                .noc       = NOC::RISCV_0_default,
-                .defines   = kdefines,
-            });
-        // Each core processes exactly 1 vector
-        for (uint32_t cy = 0u; cy < cores_y; ++cy) {
-            for (uint32_t cx = 0u; cx < cores_x; ++cx) {
-                uint32_t vec_idx = cy * cores_x + cx;
-                tt::tt_metal::CoreCoord c{cx, cy};
-                SetRuntimeArgs(prog, rk, c,
-                    {static_cast<uint32_t>(src_addr), 1u, kD, 1u,
-                     static_cast<uint32_t>(cent_addr), vec_idx});
-            }
-        }
+        SetRuntimeArgs(prog, rk, core, {static_cast<uint32_t>(src_addr), vecs_per_chip, kD, kN});
     }
 
     // Stage dump writer (RISCV_1)
@@ -217,7 +195,7 @@ static std::vector<uint8_t> run_isolated_stage(
         {"TQ_DUMP_PAGE_BYTES", std::to_string(dump_page_bytes)},
     };
     auto wk = CreateKernel(prog,
-        "kernels/dataflow/stage_dump_writer.cpp", core_range,
+        "/hdd/john/TurboQuant-Tenstorrent/kernels/dataflow/stage_dump_writer.cpp", core_range,
         DataMovementConfig{
             .processor = DataMovementProcessor::RISCV_1,
             .noc       = NOC::RISCV_1_default,
@@ -243,57 +221,84 @@ static std::vector<uint8_t> run_isolated_stage(
 int main(int argc, char* argv[]) {
     uint32_t num_vectors = 64u;
     std::string mode = "full";
+    std::string chips_str = "0";
 
     for (int i = 1; i < argc; ++i) {
         std::string a(argv[i]);
         if      (a == "--num-vectors" && i + 1 < argc) num_vectors = std::atoi(argv[++i]);
         else if (a == "--mode"        && i + 1 < argc) mode        = argv[++i];
+        else if (a == "--chips"       && i + 1 < argc) chips_str   = argv[++i];
     }
 
     std::cout << "[TurboQuant] d=" << kD << " b=" << kB
               << " k=" << kK << " N=" << num_vectors << "\n\n";
 
-    auto test_vecs = gen_test_vectors(num_vectors, kD);
-    std::vector<uint16_t> input_bf16(num_vectors * kD);
-    for (uint32_t i = 0; i < num_vectors; ++i)
-        for (uint32_t j = 0; j < kD; ++j)
-            input_bf16[i * kD + j] = float_to_bf16(test_vecs[i][j]);
-    write_bin("dump_input.bin", input_bf16.data(), input_bf16.size() * 2);
+    auto parse_chips = [&](const std::string& s) {
+        std::vector<int> out;
+        std::string tmp;
+        for (char c : s) {
+            if (c == ',') { if (!tmp.empty()) { out.push_back(std::stoi(tmp)); tmp.clear(); } }
+            else tmp.push_back(c);
+        }
+        if (!tmp.empty()) out.push_back(std::stoi(tmp));
+        if (out.empty()) out.push_back(6);
+        return out;
+    };
 
-    auto mesh_dev = distributed::MeshDevice::create_unit_mesh(6);
+    std::vector<int> chips = parse_chips(chips_str);
+    const uint32_t num_devices = chips.size();
+
+    distributed::MeshDeviceConfig cfg(
+        distributed::MeshShape{1, num_devices},
+        std::nullopt,
+        std::vector<distributed::ChipId>(chips.begin(), chips.end())
+    );
+    auto mesh_dev = distributed::MeshDevice::create(cfg);
     distributed::MeshCommandQueue& cq = mesh_dev->mesh_command_queue();
     distributed::MeshCoordinateRange dev_range(mesh_dev->shape());
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
-    auto input_buf = make_mesh_buf(mesh_dev.get(), num_vectors * kD * 2, kD * 2);
+    uint32_t vecs_per_chip = (num_vectors + num_devices - 1) / num_devices;
+    uint32_t padded_num_vectors = vecs_per_chip * num_devices;
+    
+    auto test_vecs = gen_test_vectors(num_vectors, kD);
+    std::vector<uint16_t> input_bf16(padded_num_vectors * kD, 0u);
+    for (uint32_t i = 0; i < num_vectors; ++i) {
+        for (uint32_t j = 0; j < kD; ++j) {
+            input_bf16[i * kD + j] = float_to_bf16(test_vecs[i][j]);
+        }
+    }
+    write_bin("dump_input.bin", input_bf16.data(), padded_num_vectors  * kD * 2);
+
+    uint32_t input_bytes_per_chip = vecs_per_chip * kD * 2;
+    auto input_buf = make_sharded_buf(mesh_dev.get(), input_bytes_per_chip, kD * 2);
     distributed::EnqueueWriteMeshBuffer(cq, input_buf, input_bf16, /*blocking=*/true);
     const uint64_t src_addr = input_buf->address();
 
     const uint32_t bytes_fp16 = kN * kD * 2;
     const uint32_t bytes_pq   = kN * turboquant::kPolarQuantBytes;
-    const uint32_t bytes_qjl  = kN * (turboquant::kQjlBytes + turboquant::kRNormBytes);
 
     std::cout << "[Stage 0] rotation_kernel -> dump_rotated.bin\n";
     {
         auto raw = run_isolated_stage(mesh_dev.get(), cq, dev_range,
-                                      src_addr, num_vectors, 0,
+                                      src_addr, vecs_per_chip, 0, 
                                       tt::CB::c_in1, bytes_fp16);
-        write_bin("dump_rotated.bin", raw.data(), raw.size());
+        write_bin("dump_rotated.bin", raw.data(), num_vectors * kD * 2);
     }
 
     // Upload rotated vectors back to DRAM for polarquant to read
     auto rot_raw = read_bin("dump_rotated.bin");
-    auto rot_buf = make_mesh_buf(mesh_dev.get(), rot_raw.size(), kD * 2);
-    distributed::EnqueueWriteMeshBuffer(cq, rot_buf,
-        std::vector<uint16_t>(reinterpret_cast<uint16_t*>(rot_raw.data()),
-                              reinterpret_cast<uint16_t*>(rot_raw.data() + rot_raw.size())),
-        /*blocking=*/true);
+    auto rot_buf = make_sharded_buf(mesh_dev.get(), vecs_per_chip * kD * 2, kD * 2);
+    
+    std::vector<uint16_t> rot_padded(vecs_per_chip * num_devices * kD, 0u);
+    std::memcpy(rot_padded.data(), rot_raw.data(), rot_raw.size());
+    distributed::EnqueueWriteMeshBuffer(cq, rot_buf, rot_padded, /*blocking=*/true);
     const uint64_t rot_addr = rot_buf->address();
     std::cout << "\n[Stage 1a] polarquant_kernel -> dump_quant_indices.bin\n";
     {
         auto raw = run_isolated_stage(mesh_dev.get(), cq, dev_range,
-                                      rot_addr, num_vectors, 1,
+                                      rot_addr, vecs_per_chip, 1,
                                       tt::CB::c_in2, bytes_pq);
         write_bin("dump_quant_indices.bin", raw.data(), raw.size());
     }
@@ -301,7 +306,7 @@ int main(int argc, char* argv[]) {
     std::cout << "\n[Stage 1b] polarquant_kernel -> dump_quant_centroids.bin\n";
     {
         auto raw = run_isolated_stage(mesh_dev.get(), cq, dev_range,
-                                      rot_addr, num_vectors, 1,
+                                      rot_addr, vecs_per_chip, 1,
                                       tt::CB::c_in3, bytes_fp16);
         write_bin("dump_quant_centroids.bin", raw.data(), raw.size());
     }
@@ -310,36 +315,28 @@ int main(int argc, char* argv[]) {
     {
         // Upload centroids back to DRAM for QJL to read
         auto cent_raw = read_bin("dump_quant_centroids.bin");
-        auto cent_buf = make_mesh_buf(mesh_dev.get(), cent_raw.size(), kD * 2);
-        distributed::EnqueueWriteMeshBuffer(cq, cent_buf,
-            std::vector<uint16_t>(reinterpret_cast<uint16_t*>(cent_raw.data()),
-                                  reinterpret_cast<uint16_t*>(cent_raw.data() + cent_raw.size())),
-            /*blocking=*/true);
+        auto cent_buf = make_sharded_buf(mesh_dev.get(), vecs_per_chip * kD * 2, kD * 2);
+        
+        std::vector<uint16_t> cent_padded(vecs_per_chip * num_devices * kD, 0u);
+        std::memcpy(cent_padded.data(), cent_raw.data(), cent_raw.size());
+        distributed::EnqueueWriteMeshBuffer(cq, cent_buf, cent_padded, /*blocking=*/true);
         const uint64_t cent_addr = cent_buf->address();
 
-        // Allocate QJL output buffer: num_vectors * kRecBytes
-        const uint32_t kRecBytes       = (kK + 7) / 8 + 2;
-
-        const uint32_t kDramAlign     = tt::tt_metal::hal::get_dram_alignment();
-
+        const uint32_t kRecBytes = (kK + 7) / 8 + 2;
+        const uint32_t kDramAlign = tt::tt_metal::hal::get_dram_alignment();
         const uint32_t kRecBytesPadded = (kRecBytes + kDramAlign - 1) & ~(kDramAlign - 1);
+        auto qjl_out_buf = make_sharded_buf(mesh_dev.get(),
 
-        auto qjl_out_buf = make_mesh_buf(mesh_dev.get(),
-
-                                         num_vectors * kRecBytesPadded,
+                                         vecs_per_chip * kRecBytesPadded, 
 
                                          kRecBytesPadded);
 
-        const uint64_t qjl_out_addr = qjl_out_buf->address();
-        // Multi-core QJL: 32 cores, one per vector
-        const uint32_t cores_x = 8u, cores_y = 4u;
         Program prog2 = CreateProgram();
-        // Use device compute grid, skip row 0 col 0 (dispatch)
-        auto grid = mesh_dev->compute_with_storage_grid_size();
         // Use rows 0..cores_y-1, cols 1..cores_x (skip col 0 dispatch)
+        const uint32_t cores_x = 8u, cores_y = 4u;
         tt::tt_metal::CoreRange qjl_range(
             tt::tt_metal::CoreCoord{0, 2},
-            tt::tt_metal::CoreCoord{7, 5});
+            tt::tt_metal::CoreCoord{cores_x - 1, cores_y + 1});
 
         std::map<std::string, std::string> qjl_defines = {
             {"TQ_DIM",           std::to_string(kD)},
@@ -362,7 +359,7 @@ int main(int argc, char* argv[]) {
         make_cb2(tt::CB::c_in3,  kD * 2,    tt::DataFormat::Float16_b);
         make_cb2(tt::CB::c_out0, kRecBytes,  tt::DataFormat::RawUInt8);
 
-        auto qjl_k = CreateKernel(prog2, "kernels/qjl_kernel.cpp", qjl_range,
+        auto qjl_k = CreateKernel(prog2, "../kernels/qjl_kernel.cpp", qjl_range,
             DataMovementConfig{
                 .processor = DataMovementProcessor::RISCV_0,
                 .noc       = NOC::RISCV_0_default,
@@ -373,20 +370,18 @@ int main(int argc, char* argv[]) {
             for (uint32_t cx = 0u; cx < cores_x; ++cx) {
                 uint32_t vi = cy * cores_x + cx;
                 tt::tt_metal::CoreCoord c{cx, cy + 2};
-                SetRuntimeArgs(prog2, qjl_k, c,
-                    {static_cast<uint32_t>(src_addr), 1u, kD, 1u,
-                     static_cast<uint32_t>(cent_addr), vi,
-                     static_cast<uint32_t>(qjl_out_addr),
-                     kRecBytesPadded});
+                std::vector<uint32_t> qjl_args = {
+                    static_cast<uint32_t>(input_buf->address()), 1u, kD, 1u,
+                    static_cast<uint32_t>(cent_addr), vi,
+                    static_cast<uint32_t>(qjl_out_buf->address()),
+                    kRecBytesPadded
+                };
+                SetRuntimeArgs(prog2, qjl_k, c, qjl_args);
             }
         }
 
         distributed::MeshWorkload wl2;
-        // Only run on local chip (coord {0,0}), not remote chip 16
-        distributed::MeshCoordinateRange local_range(
-            distributed::MeshCoordinate{0, 0},
-            distributed::MeshCoordinate{0, 0});
-        wl2.add_program(local_range, std::move(prog2));
+        wl2.add_program(dev_range, std::move(prog2));
         distributed::EnqueueMeshWorkload(cq, wl2, /*blocking=*/true);
 
         // Read QJL output (deinterleave padding)
@@ -423,7 +418,7 @@ int main(int argc, char* argv[]) {
         auto qjl_raw = read_bin("dump_qjl.bin");
 
         const uint32_t pq_page  = bytes_pq;
-        const uint32_t qjl_page = bytes_qjl;
+        const uint32_t qjl_page = kN * (turboquant::kQjlBytes + turboquant::kRNormBytes);
         const uint32_t pq_vec   = turboquant::kPolarQuantBytes;
         const uint32_t qjl_vec  = turboquant::kQjlBytes + turboquant::kRNormBytes;
         const uint32_t rec      = turboquant::kRecordBytes;

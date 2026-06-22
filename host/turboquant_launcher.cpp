@@ -24,6 +24,7 @@ static constexpr const char* HOST_EXE = "./turboquant_host";
 struct LaunchConfig {
     uint32_t    num_vectors = 64;
     std::string mode        = "full";   // "full" only for now
+    std::string chips       = "0";     // comma-separated chip ids
 };
 
 // ---------------------------------------------------------------------------
@@ -38,19 +39,34 @@ struct Preset {
 
 static const Preset PRESETS[] = {
     {
-        "Smoke Test",
-        "64 vectors, d=128, b=4 — quick sanity check after build",
-        {64, "full"},
+        "Smoke Test (Single Device)",
+        "64 vectors, d=128, b=4 — quick sanity check after build on chip 0",
+        {64, "full", "0"},
     },
     {
-        "Medium Batch",
-        "256 vectors — moderate validation run",
-        {256, "full"},
+        "Smoke Test (Multi-Device)",
+        "64 vectors, d=128, b=4 — quick sanity check on chips 0 and 1",
+        {64, "full", "0,1"},
     },
     {
-        "Large Batch",
-        "1024 vectors — stress test for tile pipelining",
-        {1024, "full"},
+        "Medium Batch (Single Device)",
+        "256 vectors — moderate validation run on chip 0",
+        {256, "full", "0"},
+    },
+    {
+        "Medium Batch (Multi-Device)",
+        "256 vectors — moderate validation run distributed across chips 0 and 1",
+        {256, "full", "0,1"},
+    },
+    {
+        "Large Batch (Single Device)",
+        "1024 vectors — stress test for tile pipelining on chip 0",
+        {1024, "full", "0"},
+    },
+    {
+        "Large Batch (Multi-Device)",
+        "1024 vectors — stress test for tile pipelining across chips 0 and 1",
+        {1024, "full", "0,1"},
     },
 };
 
@@ -79,6 +95,13 @@ static std::string read_line(const std::string& fallback = "") {
     auto last  = line.find_last_not_of(" \t\r\n");
     if (first == std::string::npos) return fallback;
     return line.substr(first, last - first + 1);
+}
+
+static std::string prompt_string(const std::string& q, const std::string& def) {
+    std::cout << q << " [default: " << def << "]: ";
+    std::string raw = read_line();
+    if (raw.empty()) return def;
+    return raw;
 }
 
 static uint32_t prompt_uint(const std::string& q, uint32_t def) {
@@ -130,6 +153,7 @@ static LaunchConfig select_config() {
         if (choice == NUM_PRESETS + 1) {
             LaunchConfig cfg;
             cfg.num_vectors = prompt_uint("Number of vectors to quantize", 64);
+            cfg.chips = prompt_string("Comma-separated chip ids", "6");
             return cfg;
         }
         std::cout << "  Invalid — enter 0–" << (NUM_PRESETS + 1) << ".\n\n";
@@ -140,7 +164,8 @@ static void print_config(const LaunchConfig& cfg) {
     print_separator();
     std::cout << " Configuration summary:\n\n"
               << "  Vectors : " << cfg.num_vectors << "\n"
-              << "  Mode    : " << cfg.mode << "\n";
+              << "  Mode    : " << cfg.mode << "\n"
+              << "  Chips   : " << cfg.chips << "\n";
     print_separator();
 }
 
@@ -148,6 +173,7 @@ static std::vector<std::string> build_args(const LaunchConfig& cfg) {
     return {
         "--num-vectors", std::to_string(cfg.num_vectors),
         "--mode",        cfg.mode,
+        "--chips",       cfg.chips,
     };
 }
 
