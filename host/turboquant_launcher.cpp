@@ -4,7 +4,6 @@
 // Prompts the user for configuration options (with sensible defaults) then
 // execs turboquant_host with the resulting arguments.
 //
-// Mirrors the structure of rref_tenstorrent/rref_launcher.cpp.
 
 #include <cstdint>
 #include <cstdlib>
@@ -15,7 +14,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-static constexpr const char* HOST_EXE = "./turboquant_host";
+static constexpr const char* HOST_EXE = "./build/turboquant_host";
 
 // ---------------------------------------------------------------------------
 // LaunchConfig
@@ -24,7 +23,7 @@ static constexpr const char* HOST_EXE = "./turboquant_host";
 struct LaunchConfig {
     uint32_t    num_vectors = 64;
     std::string mode        = "full";   // "full" only for now
-    std::string chips       = "0";     // comma-separated chip ids
+    uint32_t    num_devices = 2;        // 1 for single-chip, 2 for sharded
 };
 
 // ---------------------------------------------------------------------------
@@ -38,35 +37,38 @@ struct Preset {
 };
 
 static const Preset PRESETS[] = {
+    // Single-Device Presets
     {
-        "Smoke Test (Single Device)",
-        "64 vectors, d=128, b=4 — quick sanity check after build on chip 0",
-        {64, "full", "0"},
+        "Smoke Test (1 Device)",
+        "64 vectors, d=128, b=4 — quick sanity check on a single chip",
+        {64, "full", 1},
     },
     {
-        "Smoke Test (Multi-Device)",
-        "64 vectors, d=128, b=4 — quick sanity check on chips 0 and 1",
-        {64, "full", "0,1"},
+        "Medium Batch (1 Device)",
+        "256 vectors — moderate validation run on a single chip",
+        {256, "full", 1},
     },
     {
-        "Medium Batch (Single Device)",
-        "256 vectors — moderate validation run on chip 0",
-        {256, "full", "0"},
+        "Large Batch (1 Device)",
+        "1024 vectors — single chip stress test for tile pipelining",
+        {1024, "full", 1},
+    },
+    
+    // Multi-Device Presets
+    {
+        "Smoke Test (Multiple Devices)",
+        "64 vectors — quick sanity check on multiple chips",
+        {64, "full", 2},
     },
     {
-        "Medium Batch (Multi-Device)",
-        "256 vectors — moderate validation run distributed across chips 0 and 1",
-        {256, "full", "0,1"},
+        "Medium Batch (Multiple Devices)",
+        "256 vectors — moderate validation run on a multiple chips",
+        {256, "full", 2},
     },
     {
-        "Large Batch (Single Device)",
-        "1024 vectors — stress test for tile pipelining on chip 0",
-        {1024, "full", "0"},
-    },
-    {
-        "Large Batch (Multi-Device)",
-        "1024 vectors — stress test for tile pipelining across chips 0 and 1",
-        {1024, "full", "0,1"},
+        "Large Batch (Multiple Devices)",
+        "1024 vectors — multiple chip stress test for tile pipelining",
+        {1024, "full", 2},
     },
 };
 
@@ -97,13 +99,6 @@ static std::string read_line(const std::string& fallback = "") {
     return line.substr(first, last - first + 1);
 }
 
-static std::string prompt_string(const std::string& q, const std::string& def) {
-    std::cout << q << " [default: " << def << "]: ";
-    std::string raw = read_line();
-    if (raw.empty()) return def;
-    return raw;
-}
-
 static uint32_t prompt_uint(const std::string& q, uint32_t def) {
     while (true) {
         std::cout << q << " [default: " << def << "]: ";
@@ -129,8 +124,13 @@ static bool prompt_yesno(const std::string& q, bool def = true) {
 // ---------------------------------------------------------------------------
 
 static void print_preset_menu() {
-    std::cout << " Select an option:\n\n  [Presets]\n";
-    for (int i = 0; i < NUM_PRESETS; ++i) {
+    std::cout << " Select an option:\n\n  [Presets - Single Device]\n";
+    for (int i = 0; i < 3; ++i) {
+        std::cout << "  " << (i + 1) << "  " << PRESETS[i].name << "\n"
+                  << "     " << PRESETS[i].description << "\n";
+    }
+    std::cout << "\n  [Presets - 2-Chip Sharded]\n";
+    for (int i = 3; i < NUM_PRESETS; ++i) {
         std::cout << "  " << (i + 1) << "  " << PRESETS[i].name << "\n"
                   << "     " << PRESETS[i].description << "\n";
     }
@@ -153,7 +153,7 @@ static LaunchConfig select_config() {
         if (choice == NUM_PRESETS + 1) {
             LaunchConfig cfg;
             cfg.num_vectors = prompt_uint("Number of vectors to quantize", 64);
-            cfg.chips = prompt_string("Comma-separated chip ids", "6");
+            cfg.num_devices = prompt_uint("Number of target devices (1 or 2)", 2);
             return cfg;
         }
         std::cout << "  Invalid — enter 0–" << (NUM_PRESETS + 1) << ".\n\n";
@@ -165,7 +165,7 @@ static void print_config(const LaunchConfig& cfg) {
     std::cout << " Configuration summary:\n\n"
               << "  Vectors : " << cfg.num_vectors << "\n"
               << "  Mode    : " << cfg.mode << "\n"
-              << "  Chips   : " << cfg.chips << "\n";
+              << "  Devices : " << cfg.num_devices << (cfg.num_devices > 1 ? " (Mesh Sharded)" : " (Single)") << "\n";
     print_separator();
 }
 
@@ -173,7 +173,7 @@ static std::vector<std::string> build_args(const LaunchConfig& cfg) {
     return {
         "--num-vectors", std::to_string(cfg.num_vectors),
         "--mode",        cfg.mode,
-        "--chips",       cfg.chips,
+        "--num-devices", std::to_string(cfg.num_devices)
     };
 }
 
