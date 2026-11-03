@@ -5,9 +5,12 @@ the baseline uses.
 
 ## Current baseline
 
-The working pipeline runs on `MeshDevice::create_unit_mesh(6)` -- a single
-chip (chip 6, the local L-die that's PCIe-accessible). Of 32 physical
-chips, 31 are completely idle. Cluster utilization: ~3%.
+The working pipeline runs on `MeshDevice::create_unit_mesh(0)` -- a single
+chip (chip 0, the PCIe chip of the card picked with `TT_VISIBLE_DEVICES`).
+Cards that are not ethernet-cabled to each other cannot form one mesh;
+`multi_tile/run_bench.sh` runs one process per card on its own slice instead.
+For the baseline, `rank_bindings.yaml` and `n300_disjoint_mgd.textproto` do the
+same under tt-run (needs tt-metal built with `ENABLE_DISTRIBUTED=ON`).
 
 ## What this folder is for
 

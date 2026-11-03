@@ -30,6 +30,17 @@ message(STATUS "TT_METAL_HOME = ${TT_METAL_HOME}")
 #   Libs    : $TT_METAL_HOME/build/lib/
 # ---------------------------------------------------------------------------
 
+# Header-only dependencies tt-metal fetched with CPM, one hashed folder each.
+file(GLOB TT_CPM_INCLUDES LIST_DIRECTORIES true
+    ${TT_METAL_HOME}/.cpmcache/fmt/*/include
+    ${TT_METAL_HOME}/.cpmcache/spdlog/*/include
+    ${TT_METAL_HOME}/.cpmcache/tt-logger/*/include
+    ${TT_METAL_HOME}/.cpmcache/nlohmann_json/*/include
+    ${TT_METAL_HOME}/.cpmcache/enchantum/*/enchantum/include
+    ${TT_METAL_HOME}/.cpmcache/reflect/*
+)
+list(FILTER TT_CPM_INCLUDES EXCLUDE REGEX "cmake\\.lock$")
+
 set(TT_METAL_INCLUDES
     ${TT_METAL_HOME}
     ${TT_METAL_HOME}/tt_metal
@@ -37,19 +48,32 @@ set(TT_METAL_INCLUDES
     ${TT_METAL_HOME}/tt_metal/api/tt-metalium
     ${TT_METAL_HOME}/build_Release/include
     ${TT_METAL_HOME}/build_Release/include/tt-metalium
+    ${TT_METAL_HOME}/build_Release/tt_metal/api
+    ${TT_METAL_HOME}/tt_stl
+    ${TT_METAL_HOME}/tt_metal/hostdevcommon/api
     ${TT_METAL_HOME}/tt_metal/hw/inc
     ${TT_METAL_HOME}/tt_metal/third_party/fmt/include
     ${TT_METAL_HOME}/tt_metal/third_party/umd
     ${TT_METAL_HOME}/tt_metal/third_party/umd/device
-    ${TT_METAL_HOME}/.cpmcache/spdlog/b1c2586bb5c35a7929362e87f62433eb68206873/include
+    ${TT_METAL_HOME}/tt_metal/third_party/umd/device/api
+    ${TT_METAL_HOME}/tt_metal/third_party/tracy/public
+    ${TT_CPM_INCLUDES}
 )
+# tt-metal builds spdlog against the external fmt; headers must agree.
+add_compile_definitions(SPDLOG_FMT_EXTERNAL)
 
 # ---------------------------------------------------------------------------
 # Libraries
 # Confirmed present: libtt_metal.so  libdevice.so  libfmt.so  libtt_stl.so
 # ---------------------------------------------------------------------------
 
-set(TT_LIB_DIR ${TT_METAL_HOME}/build/lib)
+# build_metal.sh installs the libraries into build/lib; a plain ninja build of
+# the tt_metal target leaves them next to their targets in build_Release/.
+set(TT_LIB_DIR
+    ${TT_METAL_HOME}/build/lib
+    ${TT_METAL_HOME}/build_Release/tt_metal
+    ${TT_METAL_HOME}/build_Release/tt_stl
+)
 
 find_library(TT_METAL_LIB  tt_metal  PATHS ${TT_LIB_DIR} NO_DEFAULT_PATH REQUIRED)
 find_library(TT_DEVICE_LIB device    PATHS ${TT_LIB_DIR} NO_DEFAULT_PATH)
@@ -94,8 +118,8 @@ target_link_libraries(turboquant_host PRIVATE
 # Embed RPATH so the binary finds the .so files at runtime without
 # needing LD_LIBRARY_PATH
 set_target_properties(turboquant_host PROPERTIES
-    BUILD_RPATH   ${TT_LIB_DIR}
-    INSTALL_RPATH ${TT_LIB_DIR}
+    BUILD_RPATH   "${TT_LIB_DIR}"
+    INSTALL_RPATH "${TT_LIB_DIR}"
 )
 
 # ---------------------------------------------------------------------------
@@ -125,8 +149,8 @@ target_link_libraries(turboquant_multi_tile PRIVATE
 )
 
 set_target_properties(turboquant_multi_tile PROPERTIES
-    BUILD_RPATH   ${TT_LIB_DIR}
-    INSTALL_RPATH ${TT_LIB_DIR}
+    BUILD_RPATH   "${TT_LIB_DIR}"
+    INSTALL_RPATH "${TT_LIB_DIR}"
 )
 
 # ---------------------------------------------------------------------------
@@ -156,8 +180,8 @@ target_link_libraries(turboquant_multi_tile_pq PRIVATE
 )
 
 set_target_properties(turboquant_multi_tile_pq PROPERTIES
-    BUILD_RPATH   ${TT_LIB_DIR}
-    INSTALL_RPATH ${TT_LIB_DIR}
+    BUILD_RPATH   "${TT_LIB_DIR}"
+    INSTALL_RPATH "${TT_LIB_DIR}"
 )
 
 # ---------------------------------------------------------------------------
@@ -187,8 +211,8 @@ target_link_libraries(turboquant_multi_tile_ir PRIVATE
 )
 
 set_target_properties(turboquant_multi_tile_ir PROPERTIES
-    BUILD_RPATH   ${TT_LIB_DIR}
-    INSTALL_RPATH ${TT_LIB_DIR}
+    BUILD_RPATH   "${TT_LIB_DIR}"
+    INSTALL_RPATH "${TT_LIB_DIR}"
 )
 
 # ---------------------------------------------------------------------------
@@ -205,7 +229,7 @@ target_include_directories(turboquant_multi_tile_resid PRIVATE
 target_link_libraries(turboquant_multi_tile_resid PRIVATE
     ${TT_METAL_LIB} ${TT_OPTIONAL_LIBS} pthread dl)
 set_target_properties(turboquant_multi_tile_resid PROPERTIES
-    BUILD_RPATH ${TT_LIB_DIR} INSTALL_RPATH ${TT_LIB_DIR})
+    BUILD_RPATH "${TT_LIB_DIR}" INSTALL_RPATH "${TT_LIB_DIR}")
 
 # ---------------------------------------------------------------------------
 # Multi-tile Stage 2b2 (QJL sign projection) host
@@ -222,7 +246,7 @@ target_include_directories(turboquant_multi_tile_proj PRIVATE
 target_link_libraries(turboquant_multi_tile_proj PRIVATE
     ${TT_METAL_LIB} ${TT_OPTIONAL_LIBS} pthread dl)
 set_target_properties(turboquant_multi_tile_proj PROPERTIES
-    BUILD_RPATH ${TT_LIB_DIR} INSTALL_RPATH ${TT_LIB_DIR})
+    BUILD_RPATH "${TT_LIB_DIR}" INSTALL_RPATH "${TT_LIB_DIR}")
 
 # ---------------------------------------------------------------------------
 # Multi-tile Stage 2c (r_norm) host
@@ -238,7 +262,7 @@ target_include_directories(turboquant_multi_tile_rnorm PRIVATE
 target_link_libraries(turboquant_multi_tile_rnorm PRIVATE
     ${TT_METAL_LIB} ${TT_OPTIONAL_LIBS} pthread dl)
 set_target_properties(turboquant_multi_tile_rnorm PROPERTIES
-    BUILD_RPATH ${TT_LIB_DIR} INSTALL_RPATH ${TT_LIB_DIR})
+    BUILD_RPATH "${TT_LIB_DIR}" INSTALL_RPATH "${TT_LIB_DIR}")
 
 # ---------------------------------------------------------------------------
 # Launcher binary (no TT-Metal dependency)

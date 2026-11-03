@@ -7,8 +7,8 @@
 #include "api/compute/eltwise_binary.h"
 
 void kernel_main() {
-    constexpr uint32_t Mt = get_compile_time_arg_val(0);
-    constexpr uint32_t Dt = get_compile_time_arg_val(1);
+    uint32_t Mt = get_arg_val<uint32_t>(0);  // tile rows of this core's run
+    constexpr uint32_t Dt = get_compile_time_arg_val(0);
 
     constexpr auto cb_r    = tt::CBIndex::c_0;
     constexpr auto cb_rsq  = tt::CBIndex::c_16;

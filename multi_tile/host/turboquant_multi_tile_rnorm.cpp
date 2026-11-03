@@ -18,6 +18,8 @@
 #include <chrono>
 
 #include "tile_layout.h"
+#include "core_split.h"
+#include "graceful_exit.h"
 
 namespace tq = turboquant::multi_tile;
 using namespace tt::tt_metal;
@@ -58,11 +60,15 @@ static std::shared_ptr<MeshBuffer> make_mesh_buf(
     return MeshBuffer::create(rep, local, dev);
 }
 
-int main(int argc, char** argv) {
-    uint32_t num_vectors = 32;
+static int run(int argc, char** argv) {
+    uint32_t num_vectors = 32, num_cores = 1, iters = 0;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--num-vectors" && i + 1 < argc)
             num_vectors = std::atoi(argv[++i]);
+        else if (std::string(argv[i]) == "--cores" && i + 1 < argc)
+            num_cores = std::atoi(argv[++i]);
+        else if (std::string(argv[i]) == "--iters" && i + 1 < argc)
+            iters = std::atoi(argv[++i]);
     }
     constexpr uint32_t d = tq::D;
     if (num_vectors % tq::TILE_HEIGHT != 0) {
@@ -90,7 +96,7 @@ int main(int argc, char** argv) {
     // column 0 of output is what we want.
     auto ones_tiles = tilize_bf16(ones_flat, d, d);
 
-    auto mesh_dev = MeshDevice::create_unit_mesh(6);
+    auto mesh_dev = MeshDevice::create_unit_mesh(0);
     auto& cq = mesh_dev->mesh_command_queue();
     MeshCoordinateRange dev_range(MeshCoordinate{0, 0}, MeshCoordinate{0, 0});
 
@@ -103,11 +109,14 @@ int main(int argc, char** argv) {
     EnqueueWriteMeshBuffer(cq, r_buf,    r_tiles,    true);
     EnqueueWriteMeshBuffer(cq, ones_buf, ones_tiles, true);
 
+    // Both passes use the same split of the Mt tile-rows across cores
+    const auto split = tq::split_tile_rows(Mt, num_cores, mesh_dev->compute_with_storage_grid_size());
+    const auto& core_range = split.cores;
+    std::cout << "  Cores: " << split.runs.size() << "\n";
+
     // ------------ Pass 2c1: square ------------
     {
         Program prog = CreateProgram();
-        tt::tt_metal::CoreCoord core{0, 0};
-        tt::tt_metal::CoreRange core_range(core, core);
 
         auto make_cb = [&](tt::CB id, uint32_t n_pages) {
             std::map<uint8_t, tt::DataFormat> spec = {
@@ -128,32 +137,28 @@ int main(int argc, char** argv) {
             "multi_tile/kernels/rsquare_writer.cpp", core_range,
             DataMovementConfig{ .processor = DataMovementProcessor::RISCV_1,
                                 .noc = NOC::RISCV_1_default });
-        std::vector<uint32_t> cargs = {Mt, Dt};
-        CreateKernel(prog,
+        std::vector<uint32_t> cargs = {Dt};
+        auto compute_id = CreateKernel(prog,
             "multi_tile/kernels/rsquare_compute.cpp", core_range,
             ComputeConfig{ .math_fidelity = MathFidelity::HiFi4, .compile_args = cargs });
 
-        SetRuntimeArgs(prog, reader_id, core,
-            {static_cast<uint32_t>(r_buf->address()), Mt, Dt});
-        SetRuntimeArgs(prog, writer_id, core,
-            {static_cast<uint32_t>(rsq_buf->address()), Mt, Dt});
+        for (const auto& r : split.runs) {
+            SetRuntimeArgs(prog, reader_id, r.core,
+                {static_cast<uint32_t>(r_buf->address()), r.mt_count, Dt, r.mt_start});
+            SetRuntimeArgs(prog, writer_id, r.core,
+                {static_cast<uint32_t>(rsq_buf->address()), r.mt_count, Dt, r.mt_start});
+            SetRuntimeArgs(prog, compute_id, r.core, {r.mt_count});
+        }
 
         MeshWorkload wl;
         wl.add_program(dev_range, std::move(prog));
         std::cout << "  Dispatching 2c1 (square)...\n";
-        auto t0 = std::chrono::steady_clock::now();
-        EnqueueMeshWorkload(cq, wl, true);
-        auto t1 = std::chrono::steady_clock::now();
-        std::cout << "  2c1 time: "
-                  << std::chrono::duration<double, std::milli>(t1 - t0).count()
-                  << " ms\n";
+        tq::run_timed(cq, wl, "2c1 time", iters);
     }
 
     // ------------ Pass 2c2: matmul + sqrt ------------
     {
         Program prog = CreateProgram();
-        tt::tt_metal::CoreCoord core{0, 0};
-        tt::tt_metal::CoreRange core_range(core, core);
 
         auto make_cb = [&](tt::CB id, uint32_t n_pages) {
             std::map<uint8_t, tt::DataFormat> spec = {
@@ -175,26 +180,24 @@ int main(int argc, char** argv) {
             "multi_tile/kernels/rnorm_matmul_writer.cpp", core_range,
             DataMovementConfig{ .processor = DataMovementProcessor::RISCV_1,
                                 .noc = NOC::RISCV_1_default });
-        std::vector<uint32_t> cargs = {Mt, Dt};   // Kt == Dt
-        CreateKernel(prog,
+        std::vector<uint32_t> cargs = {Dt};   // Kt == Dt
+        auto compute_id = CreateKernel(prog,
             "multi_tile/kernels/rnorm_matmul_compute.cpp", core_range,
             ComputeConfig{ .math_fidelity = MathFidelity::HiFi4, .compile_args = cargs });
 
-        SetRuntimeArgs(prog, reader_id, core,
-            {static_cast<uint32_t>(rsq_buf->address()),
-             static_cast<uint32_t>(ones_buf->address()), Mt, Dt});
-        SetRuntimeArgs(prog, writer_id, core,
-            {static_cast<uint32_t>(norm_buf->address()), Mt});
+        for (const auto& r : split.runs) {
+            SetRuntimeArgs(prog, reader_id, r.core,
+                {static_cast<uint32_t>(rsq_buf->address()),
+                 static_cast<uint32_t>(ones_buf->address()), r.mt_count, Dt, r.mt_start});
+            SetRuntimeArgs(prog, writer_id, r.core,
+                {static_cast<uint32_t>(norm_buf->address()), r.mt_count, r.mt_start});
+            SetRuntimeArgs(prog, compute_id, r.core, {r.mt_count});
+        }
 
         MeshWorkload wl;
         wl.add_program(dev_range, std::move(prog));
         std::cout << "  Dispatching 2c2 (matmul+sqrt)...\n";
-        auto t0 = std::chrono::steady_clock::now();
-        EnqueueMeshWorkload(cq, wl, true);
-        auto t1 = std::chrono::steady_clock::now();
-        std::cout << "  2c2 time: "
-                  << std::chrono::duration<double, std::milli>(t1 - t0).count()
-                  << " ms\n";
+        tq::run_timed(cq, wl, "2c2 time", iters);
     }
 
     // Read back the norm tiles and extract column 0 of each
@@ -218,3 +221,5 @@ int main(int argc, char** argv) {
               << " bytes -> dump_rnorm_tile.bin (one bf16 r_norm per vector)\n";
     return 0;
 }
+
+int main(int argc, char** argv) { return turboquant::run_guarded(run, argc, argv); }

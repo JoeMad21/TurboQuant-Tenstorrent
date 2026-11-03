@@ -54,8 +54,8 @@ static constexpr uint32_t f2u(float f) {
 }
 
 void kernel_main() {
-    constexpr uint32_t Mt = get_compile_time_arg_val(0);  // tile rows
-    constexpr uint32_t Dt = get_compile_time_arg_val(1);  // d / 32 = 4
+    uint32_t Mt = get_arg_val<uint32_t>(0);  // tile rows of this core's run
+    constexpr uint32_t Dt = get_compile_time_arg_val(0);  // d / 32 = 4
 
     constexpr auto cb_x    = tt::CBIndex::c_0;   // input rotated tiles
     constexpr auto cb_cent = tt::CBIndex::c_16;  // output centroid tiles

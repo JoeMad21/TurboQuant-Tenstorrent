@@ -17,12 +17,15 @@
 #include <stdexcept>
 #include <algorithm>
 #include <optional>
+#include <filesystem>
 
 #include <tt-metalium/host_api.hpp>
 #include <tt-metalium/distributed.hpp>
 #include <tt-metalium/system_mesh.hpp>
+#include <tt-metalium/distributed_context.hpp>
 
 #include "turboquant_layout.h"
+#include "graceful_exit.h"
 
 #include <tt-metalium/hal.hpp>
 using namespace tt::tt_metal;
@@ -84,14 +87,19 @@ static std::vector<std::vector<float>> gen_test_vectors(
 // Binary file I/O
 // ---------------------------------------------------------------------------
 
-static void write_bin(const std::string& path, const void* data, size_t bytes) {
+// Every dump file lives in g_out_dir: "." or, under tt-run, build/out/rank<r>.
+static std::string g_out_dir = ".";
+
+static void write_bin(const std::string& name, const void* data, size_t bytes) {
+    const std::string path = g_out_dir + "/" + name;
     std::ofstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("Cannot open for writing: " + path);
     f.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(bytes));
     std::cout << "  wrote " << bytes << " bytes -> " << path << "\n";
 }
 
-static std::vector<uint8_t> read_bin(const std::string& path) {
+static std::vector<uint8_t> read_bin(const std::string& name) {
+    const std::string path = g_out_dir + "/" + name;
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) throw std::runtime_error("Cannot open: " + path);
     size_t sz = static_cast<size_t>(f.tellg()); f.seekg(0);
@@ -374,10 +382,10 @@ static std::vector<std::vector<uint8_t>> run_isolated_stage_batched(
 // Main
 // ---------------------------------------------------------------------------
 
-int main(int argc, char* argv[]) {
+static int run(int argc, char* argv[]) {
     uint32_t num_vectors = 64u;
     std::string mode = "full";
-    uint32_t requested_mesh_devices = 2u;
+    uint32_t requested_mesh_devices = 1u;  // 2 = both chips of an n300 (needs a healthy ETH link)
 
     for (int i = 1; i < argc; ++i) {
         std::string a(argv[i]);
@@ -390,27 +398,44 @@ int main(int argc, char* argv[]) {
               << " k=" << kK << " N=" << num_vectors << "\n\n";
 
     auto test_vecs = gen_test_vectors(num_vectors, kD);
+
+    // Under tt-run (multi_wormhole/rank_bindings.yaml) each rank is one card and
+    // encodes its tile-aligned slice into build/out/rank<r>/. Alone: rank 0 of 1.
+    const auto& world = distributed::multihost::DistributedContext::get_current_world();
+    const uint32_t rank = *world->rank(), num_ranks = *world->size();
+    if (num_ranks > 1) {
+        const uint32_t per = ((num_vectors + kN - 1) / kN + num_ranks - 1) / num_ranks * kN;
+        const uint32_t lo  = std::min(num_vectors, rank * per);
+        const uint32_t hi  = std::min(num_vectors, lo + per);
+        if (lo == hi) throw std::runtime_error("rank " + std::to_string(rank) + " has no vectors");
+        test_vecs.assign(test_vecs.begin() + lo, test_vecs.begin() + hi);
+        num_vectors = hi - lo;
+        g_out_dir = "build/out/rank" + std::to_string(rank);
+        std::filesystem::create_directories(g_out_dir);
+        std::cout << "[TurboQuant] rank " << rank << "/" << num_ranks
+                  << ": vectors " << lo << ".." << hi - 1 << "\n";
+    }
+
     std::vector<uint16_t> input_bf16(num_vectors * kD);
     for (uint32_t i = 0; i < num_vectors; ++i)
         for (uint32_t j = 0; j < kD; ++j)
             input_bf16[i * kD + j] = float_to_bf16(test_vecs[i][j]);
     write_bin("dump_input.bin", input_bf16.data(), input_bf16.size() * 2);
+    if (mode == "input") return 0;  // input only: any N, no device
 
-    std::optional<distributed::MeshShape> requested_shape;
-    if (requested_mesh_devices == 1) {
-        requested_shape = distributed::MeshShape{1, 1};
-    } else {
-        if (requested_mesh_devices != 2) {
-            std::cerr << "[TurboQuant] Note: --num-devices=" << requested_mesh_devices
-                      << " requested; auto-detecting system mesh shape.\n";
-        }
-        requested_shape = std::nullopt;
+    if (requested_mesh_devices != 1 && requested_mesh_devices != 2) {
+        std::cerr << "[TurboQuant] Note: --num-devices=" << requested_mesh_devices
+                  << " requested; auto-detecting system mesh shape.\n";
     }
 
-    auto mesh_dev = distributed::MeshDevice::create(distributed::MeshDeviceConfig(
-        /*mesh_shape=*/requested_shape,
-        /*offset=*/std::nullopt,
-        /*physical_device_ids=*/{}));
+    // One device is chip 0, the card's PCIe chip. A 1x1 mesh shape would take
+    // whichever chip the topology mapper puts at (0,0).
+    auto mesh_dev = (requested_mesh_devices == 1)
+        ? distributed::MeshDevice::create_unit_mesh(0)
+        : distributed::MeshDevice::create(distributed::MeshDeviceConfig(
+              /*mesh_shape=*/std::nullopt,
+              /*offset=*/std::nullopt,
+              /*physical_device_ids=*/{}));
     distributed::MeshCommandQueue& cq = mesh_dev->mesh_command_queue();
 
     auto chunks = plan_device_chunks(mesh_dev.get(), num_vectors);
@@ -624,3 +649,5 @@ int main(int argc, char* argv[]) {
               << "  python tests/test_roundtrip.py  --device\n";
     return 0;
 }
+
+int main(int argc, char* argv[]) { return turboquant::run_guarded(run, argc, argv); }

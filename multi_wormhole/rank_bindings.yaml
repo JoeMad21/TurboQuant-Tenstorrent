@@ -1,0 +1,35 @@
+# tt-run rank bindings for alpha01: one MPI rank per n300 card, each seeing only
+# its card through TT_VISIBLE_DEVICES. Needs tt-metal built with
+# ENABLE_DISTRIBUTED=ON. Run from the repository root:
+#   tt-run --bare --mpi-args "--prtemca state_base_error_non_zero_exit 0" \
+#          --rank-binding multi_wormhole/rank_bindings.yaml \
+#          ./build/turboquant_host --num-vectors 96
+# Rank r writes its slice of the dumps to build/out/rank<r>/; join them in rank
+# order with cat. To add a card: add a rank here and a mesh instance in
+# n300_disjoint_mgd.textproto. Check that the cards are idle before a run.
+
+mesh_graph_desc_path: "multi_wormhole/n300_disjoint_mgd.textproto"
+
+global_env:
+  TT_METAL_SLOW_DISPATCH_MODE: "1"   # as in every verified run on alpha01
+  TT_METAL_INSPECTOR_RPC: "0"        # no RPC port for ranks to compete for
+
+rank_bindings:
+  - rank: 0
+    mesh_id: 0
+    env_overrides:
+      TT_VISIBLE_DEVICES: "4"
+      TT_METAL_CACHE: "${PWD}/build/tt_cache/card4"
+      TT_METAL_LOGS_PATH: "${PWD}/build/out/rank0"
+  - rank: 1
+    mesh_id: 1
+    env_overrides:
+      TT_VISIBLE_DEVICES: "5"
+      TT_METAL_CACHE: "${PWD}/build/tt_cache/card5"
+      TT_METAL_LOGS_PATH: "${PWD}/build/out/rank1"
+  - rank: 2
+    mesh_id: 2
+    env_overrides:
+      TT_VISIBLE_DEVICES: "7"
+      TT_METAL_CACHE: "${PWD}/build/tt_cache/card7"
+      TT_METAL_LOGS_PATH: "${PWD}/build/out/rank2"

@@ -11,9 +11,9 @@
 #include "api/compute/matmul.h"
 
 void kernel_main() {
-    constexpr uint32_t Mt = get_compile_time_arg_val(0);
-    constexpr uint32_t Kt = get_compile_time_arg_val(1);  // = Dt of input r
-    constexpr uint32_t Nt = get_compile_time_arg_val(2);  // = Kt of QJL output
+    uint32_t Mt = get_arg_val<uint32_t>(0);  // tile rows of this core's run
+    constexpr uint32_t Kt = get_compile_time_arg_val(0);  // = Dt of input r
+    constexpr uint32_t Nt = get_compile_time_arg_val(1);  // = Kt of QJL output
 
     constexpr auto cb_r = tt::CBIndex::c_0;
     constexpr auto cb_s = tt::CBIndex::c_1;

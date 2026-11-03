@@ -146,7 +146,13 @@ Expected: end-to-end PASS, 97.95% sign-bit match (remaining ~2% are bf16 roundin
 ./build/turboquant_multi_tile_rnorm   --num-vectors 1024 --cores 8
 ```
 
-The `--cores N` flag accepts 1–64. The host lays cores out as a near-square grid (up to 8 wide) and shards the Mt tile-row dimension evenly across them. At small N where Mt < N_cores, extra cores are skipped automatically.
+The `--cores N` flag accepts 1 up to the chip's compute grid (8×7 = 56 on an n300 chip). The host takes cores row by row (8 to a row) and gives each a run of ceil(Mt / N) tile-rows. At small N where Mt < N_cores, extra cores are skipped automatically. `--iters K` reruns the stage K more times and also prints the best warm time.
+
+To time all six stages at any N, over several core counts and cards (one process per card, each on its own slice of the vectors), checking every output byte for byte against the first core count's:
+
+```bash
+./multi_tile/run_bench.sh 1048576 "1 8 56" 5 "4 5 7"    # N, core counts, warm runs, cards
+```
 
 ---
 
@@ -202,8 +208,8 @@ Remaining bit mismatches are sign flips on near-zero residual projections — th
 
 ## Known issues
 
-- **Baseline hangs at N ≥ 128.** The original baseline (`turboquant_host`) only runs at N=32 due to a hang in device buffer setup. Not investigated; the multi-tile pipeline is unaffected.
-- **Multi-tile Stage 1 not used in chain.** `run_pipeline.sh` runs Stage 1 for perf testing, but Stage 2a reads `dump_quant_centroids.bin` from the baseline (since both produce equivalent centroids within bf16 noise at N=32). Wiring them through is a small follow-up.
+- **Baseline hangs at N ≥ 128.** The original baseline (`turboquant_host`) only runs at N=32 due to a hang in device buffer setup. Not investigated; the multi-tile pipeline is unaffected. `--mode input` writes `dump_input.bin` for any N and stops before opening the device.
+- **Multi-tile Stage 1 not used in chain.** `run_pipeline.sh` runs Stage 1 for perf testing, but Stage 2a reads `dump_quant_centroids.bin` from the baseline (since both produce equivalent centroids within bf16 noise at N=32). `run_bench.sh` wires them through.
 - **Dead code in codebooks.h.** `QJL_SIGN_MATRIX_k128_d128` and related tables (~16 KB) are no longer read by any kernel — the LFSR-generated S matrix replaces them. Safe to remove.
 
 ---

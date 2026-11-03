@@ -18,6 +18,8 @@
 #include <chrono>
 
 #include "tile_layout.h"
+#include "core_split.h"
+#include "graceful_exit.h"
 
 namespace tq = turboquant::multi_tile;
 using namespace tt::tt_metal;
@@ -47,11 +49,15 @@ static std::shared_ptr<MeshBuffer> make_mesh_buf(
     return MeshBuffer::create(rep, local, dev);
 }
 
-int main(int argc, char** argv) {
-    uint32_t num_vectors = 32;
+static int run(int argc, char** argv) {
+    uint32_t num_vectors = 32, num_cores = 1, iters = 0;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--num-vectors" && i + 1 < argc) {
             num_vectors = std::atoi(argv[++i]);
+        } else if (std::string(argv[i]) == "--cores" && i + 1 < argc) {
+            num_cores = std::atoi(argv[++i]);
+        } else if (std::string(argv[i]) == "--iters" && i + 1 < argc) {
+            iters = std::atoi(argv[++i]);
         }
     }
     constexpr uint32_t d = tq::D;
@@ -68,7 +74,7 @@ int main(int argc, char** argv) {
     auto xhat_tiles = load_flat_as_tiles("dump_xhat_tile.bin", num_vectors, d);
     std::cout << "  Loaded x and xhat tiles.\n";
 
-    auto mesh_dev = MeshDevice::create_unit_mesh(6);
+    auto mesh_dev = MeshDevice::create_unit_mesh(0);
     auto& cq = mesh_dev->mesh_command_queue();
     MeshCoordinateRange dev_range(MeshCoordinate{0, 0}, MeshCoordinate{0, 0});
 
@@ -81,8 +87,9 @@ int main(int argc, char** argv) {
     EnqueueWriteMeshBuffer(cq, xhat_buf, xhat_tiles, true);
 
     Program prog = CreateProgram();
-    tt::tt_metal::CoreCoord core{0, 0};
-    tt::tt_metal::CoreRange core_range(core, core);
+    const auto split = tq::split_tile_rows(Mt, num_cores, mesh_dev->compute_with_storage_grid_size());
+    const auto& core_range = split.cores;
+    std::cout << "  Cores: " << split.runs.size() << "\n";
 
     auto make_cb = [&](tt::CB id, uint32_t n_pages) {
         std::map<uint8_t, tt::DataFormat> spec = {
@@ -108,31 +115,29 @@ int main(int argc, char** argv) {
             .processor = DataMovementProcessor::RISCV_1,
             .noc       = NOC::RISCV_1_default,
         });
-    std::vector<uint32_t> compute_args = {Mt, Dt};
-    CreateKernel(prog,
+    std::vector<uint32_t> compute_args = {Dt};
+    auto compute_id = CreateKernel(prog,
         "multi_tile/kernels/residual_compute.cpp", core_range,
         ComputeConfig{
             .math_fidelity = MathFidelity::HiFi4,
             .compile_args  = compute_args,
         });
 
-    SetRuntimeArgs(prog, reader_id, core,
-        {static_cast<uint32_t>(x_buf->address()),
-         static_cast<uint32_t>(xhat_buf->address()),
-         Mt, Dt});
-    SetRuntimeArgs(prog, writer_id, core,
-        {static_cast<uint32_t>(r_buf->address()), Mt, Dt});
+    for (const auto& r : split.runs) {
+        SetRuntimeArgs(prog, reader_id, r.core,
+            {static_cast<uint32_t>(x_buf->address()),
+             static_cast<uint32_t>(xhat_buf->address()),
+             r.mt_count, Dt, r.mt_start});
+        SetRuntimeArgs(prog, writer_id, r.core,
+            {static_cast<uint32_t>(r_buf->address()), r.mt_count, Dt, r.mt_start});
+        SetRuntimeArgs(prog, compute_id, r.core, {r.mt_count});
+    }
 
     MeshWorkload wl;
     wl.add_program(dev_range, std::move(prog));
 
     std::cout << "  Dispatching workload...\n";
-    auto t0 = std::chrono::steady_clock::now();
-    EnqueueMeshWorkload(cq, wl, true);
-    auto t1 = std::chrono::steady_clock::now();
-    std::cout << "  Dispatch+execute time: "
-              << std::chrono::duration<double, std::milli>(t1 - t0).count()
-              << " ms\n";
+    tq::run_timed(cq, wl, "Dispatch+execute time", iters);
 
     std::vector<uint16_t> r_tiles(Mt * Dt * tq::TILE_ELEMENTS);
     EnqueueReadMeshBuffer(cq, r_tiles, r_buf, true);
@@ -149,3 +154,5 @@ int main(int argc, char** argv) {
               << " bytes -> dump_r_tile.bin (flat row-major)\n";
     return 0;
 }
+
+int main(int argc, char** argv) { return turboquant::run_guarded(run, argc, argv); }

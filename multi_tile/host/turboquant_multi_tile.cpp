@@ -28,6 +28,8 @@
 #include <iostream>
 
 #include "tile_layout.h"
+#include "core_split.h"
+#include "graceful_exit.h"
 
 namespace tq = turboquant::multi_tile;
 
@@ -176,11 +178,15 @@ static std::shared_ptr<MeshBuffer> make_mesh_buf(
 // -----------------------------------------------------------------------------
 // Main
 // -----------------------------------------------------------------------------
-int main(int argc, char** argv) {
-    uint32_t num_vectors = 32;
+static int run(int argc, char** argv) {
+    uint32_t num_vectors = 32, num_cores = 1, iters = 0;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--num-vectors" && i + 1 < argc) {
             num_vectors = std::atoi(argv[++i]);
+        } else if (std::string(argv[i]) == "--cores" && i + 1 < argc) {
+            num_cores = std::atoi(argv[++i]);
+        } else if (std::string(argv[i]) == "--iters" && i + 1 < argc) {
+            iters = std::atoi(argv[++i]);
         }
     }
 
@@ -209,7 +215,7 @@ int main(int argc, char** argv) {
     // -------------------------------------------------------------------------
     // Open device
     // -------------------------------------------------------------------------
-    auto mesh_dev = MeshDevice::create_unit_mesh(6);  // chip 6 (PCIe-accessible L-die)
+    auto mesh_dev = MeshDevice::create_unit_mesh(0);  // the card's PCIe chip (card: TT_VISIBLE_DEVICES)
     auto& cq = mesh_dev->mesh_command_queue();
     MeshCoordinateRange dev_range(MeshCoordinate{0, 0}, MeshCoordinate{0, 0});
 
@@ -225,11 +231,12 @@ int main(int argc, char** argv) {
     EnqueueWriteMeshBuffer(cq, h_buf, h_tiles, /*blocking=*/true);
 
     // -------------------------------------------------------------------------
-    // Build program: single core, three kernels
+    // Build program: Mt tile-rows split across cores, three kernels
     // -------------------------------------------------------------------------
     Program prog = CreateProgram();
-    CoreCoord core{0, 0};
-    CoreRange core_range(core, core);
+    const auto split = tq::split_tile_rows(Mt, num_cores, mesh_dev->compute_with_storage_grid_size());
+    const auto& core_range = split.cores;
+    std::cout << "  Cores: " << split.runs.size() << "\n";
 
     // CBs: input X (cb_in0 == c_0), input H (cb_in1 == c_1), output Z (cb_out0 == c_16)
     auto make_cb = [&](tt::CB id, uint32_t n_pages) {
@@ -261,21 +268,24 @@ int main(int argc, char** argv) {
         });
 
     // Compute on Trisc
-    std::vector<uint32_t> compute_args = {Mt, Kt, Nt};
-    CreateKernel(prog,
+    std::vector<uint32_t> compute_args = {Kt, Nt};
+    auto compute_id = CreateKernel(prog,
         "multi_tile/kernels/rotation_compute.cpp", core_range,
         ComputeConfig{
             .math_fidelity = MathFidelity::HiFi4,
             .compile_args  = compute_args,
         });
 
-    // Runtime args
-    SetRuntimeArgs(prog, reader_id, core,
-        {static_cast<uint32_t>(x_buf->address()),
-         static_cast<uint32_t>(h_buf->address()),
-         Mt, Kt, Nt});
-    SetRuntimeArgs(prog, writer_id, core,
-        {static_cast<uint32_t>(z_buf->address()), Mt, Nt});
+    // Runtime args: each core gets its run of tile-rows
+    for (const auto& r : split.runs) {
+        SetRuntimeArgs(prog, reader_id, r.core,
+            {static_cast<uint32_t>(x_buf->address()),
+             static_cast<uint32_t>(h_buf->address()),
+             r.mt_count, Kt, Nt, r.mt_start});
+        SetRuntimeArgs(prog, writer_id, r.core,
+            {static_cast<uint32_t>(z_buf->address()), r.mt_count, Nt, r.mt_start});
+        SetRuntimeArgs(prog, compute_id, r.core, {r.mt_count});
+    }
 
     // -------------------------------------------------------------------------
     // Run
@@ -283,12 +293,7 @@ int main(int argc, char** argv) {
     MeshWorkload wl;
     wl.add_program(dev_range, std::move(prog));
     std::cout << "  Dispatching workload...\n";
-    auto t0 = std::chrono::steady_clock::now();
-    EnqueueMeshWorkload(cq, wl, /*blocking=*/true);
-    auto t1 = std::chrono::steady_clock::now();
-    double dispatch_ms =
-        std::chrono::duration<double, std::milli>(t1 - t0).count();
-    std::cout << "  Dispatch+execute time: " << dispatch_ms << " ms\n";
+    tq::run_timed(cq, wl, "Dispatch+execute time", iters);
 
     // -------------------------------------------------------------------------
     // Read output back
@@ -319,3 +324,5 @@ int main(int argc, char** argv) {
     std::cout << "[multi_tile Stage 0] done.\n";
     return 0;
 }
+
+int main(int argc, char** argv) { return turboquant::run_guarded(run, argc, argv); }

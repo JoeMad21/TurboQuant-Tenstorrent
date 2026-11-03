@@ -4,6 +4,7 @@
 void kernel_main() {
     uint32_t norm_addr = get_arg_val<uint32_t>(0);
     uint32_t Mt        = get_arg_val<uint32_t>(1);
+    uint32_t mt_start  = get_arg_val<uint32_t>(2);  // first tile-row of this core's run
 
     constexpr auto cb_norm = tt::CBIndex::c_16;
     constexpr uint32_t tile_bytes = 2048;
@@ -16,7 +17,7 @@ void kernel_main() {
 
     for (uint32_t mt = 0; mt < Mt; ++mt) {
         cb_wait_front(cb_norm, 1);
-        noc_async_write_tile(mt, norm_gen, get_read_ptr(cb_norm));
+        noc_async_write_tile(mt_start + mt, norm_gen, get_read_ptr(cb_norm));
         noc_async_write_barrier();
         cb_pop_front(cb_norm, 1);
     }
