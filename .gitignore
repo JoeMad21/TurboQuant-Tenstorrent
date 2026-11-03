@@ -22,3 +22,6 @@ dump_*.bin
 finalize_repo.sh
 commit_*.sh
 create_multi_tile_*.sh
+
+# Python bytecode
+__pycache__/
